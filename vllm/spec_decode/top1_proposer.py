@@ -1,14 +1,15 @@
+import time
 from typing import List, Optional, Set, Tuple
 
 import torch
 
-from vllm.sequence import (ExecuteModelRequest, SamplerOutput,
-                           SequenceGroupMetadata)
+from vllm.sequence import SamplerOutput
+from vllm.sequence import ExecuteModelRequest, SequenceGroupMetadata
 from vllm.spec_decode.interfaces import (SpeculativeProposals,
                                          SpeculativeProposer)
 from vllm.spec_decode.proposer_worker_base import ProposerWorkerBase
 from vllm.spec_decode.util import sampler_output_to_torch
-
+from vllm.spec_decode.profile import SpecProfiler
 
 class Top1Proposer(SpeculativeProposer):
     """Helper class which separates out sequences which would exceed the max
@@ -43,13 +44,14 @@ class Top1Proposer(SpeculativeProposer):
         self,
         execute_model_req: ExecuteModelRequest,
         seq_ids_with_bonus_token_in_last_step: Set[int],
+        proposal_len: int,
     ) -> SpeculativeProposals:
         """Get speculative proposals given the input batch.
 
         Sequences which would exceed the max model length are skipped during
         speculation.
         """
-        proposal_len = execute_model_req.num_lookahead_slots
+        # proposal_len = execute_model_req.num_lookahead_slots
         seq_group_metadata_list = execute_model_req.seq_group_metadata_list
 
         # Split speculative- and non-speculative- sequences.
@@ -80,6 +82,10 @@ class Top1Proposer(SpeculativeProposer):
                 seq_ids_with_bonus_token_in_last_step=\
                     seq_ids_with_bonus_token_in_last_step,
             )
+
+            if self._worker.speculative_config.ssd:
+                proposal_len = len(maybe_sampler_output)
+
             (
                 proposal_lens,
                 maybe_sampler_output,
@@ -88,6 +94,11 @@ class Top1Proposer(SpeculativeProposer):
                                               maybe_sampler_output,
                                               nonzero_proposal_len_indices,
                                               transposed)
+            if maybe_sampler_output == []:
+                transposed = False
+                maybe_sampler_output = None
+                nonzero_proposal_len_indices = []
+
         else:
             # If no sequences can be speculated, set sampler output to None.
             maybe_sampler_output = None
@@ -103,6 +114,17 @@ class Top1Proposer(SpeculativeProposer):
             nonzero_proposal_len_indices=nonzero_proposal_len_indices,
             sampler_transposed=transposed,
         )
+
+        # AdaSpec: eliminate redundant tokens by theoretical model
+        if self._worker.speculative_config.rsd and maybe_sampler_output is not None:
+            start_ts = time.perf_counter()
+            spec_len_list = [proposal_len] * len(seq_group_metadata_list)
+            eliminated_spec_len_list, eliminated = self._worker.model_runner._eliminate_spec_lens_cuda_graph(spec_len_list)
+            if eliminated:
+                proposal_lens = torch.tensor(eliminated_spec_len_list, dtype=torch.int8, device=proposal_lens.device)
+
+            end_ts = time.perf_counter()
+            SpecProfiler.rsd_overhead.append(end_ts - start_ts)
 
         proposals = SpeculativeProposals(
             proposal_token_ids=proposal_tokens,
@@ -138,7 +160,7 @@ class Top1Proposer(SpeculativeProposer):
 
             # Currently only proposal lens of 0 or the global batch proposal len
             # are supported.
-            # If max_proposal_len is defined, then we shall no exceed this
+            # If max_proposal_len is defined, then we shall not exceed this
             # quota for nonzero_proposal
             new_k = 0
             if (self.max_proposal_len is None

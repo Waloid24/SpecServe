@@ -1,35 +1,42 @@
 """A GPU worker class."""
 import gc
 import os
+import pickle
+import time
 from typing import Dict, List, Optional, Set, Tuple, Type, Union
 
 import torch
 import torch.distributed
 
 import vllm.envs as envs
-from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
-                         ModelConfig, ObservabilityConfig, ParallelConfig,
-                         PromptAdapterConfig, SchedulerConfig,
-                         SpeculativeConfig)
+from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
                               set_custom_all_reduce)
+from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
+from vllm.sequence import SamplerOutput
 from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
 from vllm.platforms import current_platform
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sequence import (ExecuteModelRequest, IntermediateTensors,
-                           SamplerOutput, SequenceGroupMetadata,
-                           SequenceGroupMetadataDelta)
+                           SequenceGroupMetadata, SequenceGroupMetadataDelta,
+                           SequenceData)
+from vllm.sampling_params import SamplingParams
 from vllm.worker.cache_engine import CacheEngine
 from vllm.worker.embedding_model_runner import EmbeddingModelRunner
 from vllm.worker.enc_dec_model_runner import EncoderDecoderModelRunner
 from vllm.worker.model_runner import GPUModelRunnerBase, ModelRunner
-from vllm.worker.worker_base import LocalOrDistributedWorkerBase, WorkerInput
+from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
+                                     WorkerInput)
+
+import copy
 
 logger = init_logger(__name__)
+
+_NUM_PROFILE_ITERS = 5
 
 
 class Worker(LocalOrDistributedWorkerBase):
@@ -42,46 +49,31 @@ class Worker(LocalOrDistributedWorkerBase):
 
     def __init__(
         self,
-        model_config: ModelConfig,
-        parallel_config: ParallelConfig,
-        scheduler_config: SchedulerConfig,
-        device_config: DeviceConfig,
-        cache_config: CacheConfig,
-        load_config: LoadConfig,
+        vllm_config: VllmConfig,
         local_rank: int,
         rank: int,
         distributed_init_method: str,
-        lora_config: Optional[LoRAConfig] = None,
-        speculative_config: Optional[SpeculativeConfig] = None,
-        prompt_adapter_config: Optional[PromptAdapterConfig] = None,
         is_driver_worker: bool = False,
         model_runner_cls: Optional[Type[GPUModelRunnerBase]] = None,
-        observability_config: Optional[ObservabilityConfig] = None,
     ) -> None:
-        self.model_config = model_config
-        self.parallel_config = parallel_config
+        WorkerBase.__init__(self, vllm_config)
         self.parallel_config.rank = rank
-        self.scheduler_config = scheduler_config
-        self.device_config = device_config
-        self.cache_config = cache_config
         self.local_rank = local_rank
         self.rank = rank
         self.distributed_init_method = distributed_init_method
-        self.lora_config = lora_config
-        self.load_config = load_config
-        self.prompt_adapter_config = prompt_adapter_config
         self.is_driver_worker = is_driver_worker
-        if parallel_config and is_driver_worker:
-            assert rank % parallel_config.tensor_parallel_size == 0, \
+        if is_driver_worker:
+            assert rank % self.parallel_config.tensor_parallel_size == 0, \
                    "Driver worker should be rank 0 of tensor parallel group."
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
             from vllm.utils import init_cached_hf_modules
             init_cached_hf_modules()
-        self.observability_config = observability_config
 
         # Return hidden states from target model if the draft model is an
         # mlp_speculator
+        speculative_config = self.speculative_config
+        model_config = self.model_config
         speculative_args = {} if speculative_config is None \
             or (speculative_config.draft_model_config.model ==
                 model_config.model) \
@@ -92,22 +84,14 @@ class Worker(LocalOrDistributedWorkerBase):
         ModelRunnerClass: Type[GPUModelRunnerBase] = ModelRunner
         if model_runner_cls is not None:
             ModelRunnerClass = model_runner_cls
-        elif self._is_embedding_model():
+        elif model_config.task == "embedding":
             ModelRunnerClass = EmbeddingModelRunner
         elif self._is_encoder_decoder_model():
             ModelRunnerClass = EncoderDecoderModelRunner
         self.model_runner: GPUModelRunnerBase = ModelRunnerClass(
-            model_config,
-            parallel_config,
-            scheduler_config,
-            device_config,
-            cache_config,
-            load_config=load_config,
-            lora_config=self.lora_config,
+            vllm_config=self.vllm_config,
             kv_cache_dtype=self.cache_config.cache_dtype,
             is_driver_worker=is_driver_worker,
-            prompt_adapter_config=prompt_adapter_config,
-            observability_config=observability_config,
             **speculative_args,
         )
         # Uninitialized cache engine. Will be initialized by
@@ -147,9 +131,6 @@ class Worker(LocalOrDistributedWorkerBase):
     def _is_encoder_decoder_model(self):
         return self.model_config.is_encoder_decoder_model
 
-    def _is_embedding_model(self):
-        return self.model_config.is_embedding_model
-
     def init_device(self) -> None:
         if self.device_config.device.type == "cuda":
             # torch.distributed.all_reduce does not free the input tensor until
@@ -166,6 +147,7 @@ class Worker(LocalOrDistributedWorkerBase):
             torch.cuda.set_device(self.device)
 
             _check_if_gpu_supports_dtype(self.model_config.dtype)
+            gc.collect()
             torch.cuda.empty_cache()
             self.init_gpu_memory = torch.cuda.mem_get_info()[0]
         else:
@@ -216,37 +198,222 @@ class Worker(LocalOrDistributedWorkerBase):
         # Profile the memory usage of the model and get the maximum number of
         # cache blocks that can be allocated with the remaining free memory.
         torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        free_memory_pre_profile, total_gpu_memory = torch.cuda.mem_get_info()
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         self.model_runner.profile_run()
+        torch.cuda.synchronize()
+
+        self._assert_memory_footprint_increased_during_profiling()
+
+        # Get the peak memory allocation recorded by torch
+        peak_memory = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+
+        # Check for any memory left around that may have been allocated on the
+        # gpu outside of `torch`. NCCL operations, for example, can use a few
+        # GB during a forward pass
+        torch.cuda.empty_cache()
+        torch_allocated_bytes = torch.cuda.memory_stats(
+        )["allocated_bytes.all.current"]
+        total_allocated_bytes = torch.cuda.mem_get_info(
+        )[1] - torch.cuda.mem_get_info()[0]
+        non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
+        if non_torch_allocations > 0:
+            peak_memory += non_torch_allocations
+
+        available_kv_cache_memory = (
+            total_gpu_memory * self.cache_config.gpu_memory_utilization -
+            peak_memory)
 
         # Calculate the number of blocks that can be allocated with the
         # profiled peak memory.
-        torch.cuda.synchronize()
-        free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
+        cache_block_size = self.get_cache_block_size_bytes()
+        if cache_block_size == 0:
+            num_gpu_blocks = 0
+            num_cpu_blocks = 0
+        else:
+            num_gpu_blocks = int(available_kv_cache_memory // cache_block_size)
+            num_cpu_blocks = int(self.cache_config.swap_space_bytes //
+                                 cache_block_size)
+        num_gpu_blocks = max(num_gpu_blocks, 0)
+        num_cpu_blocks = max(num_cpu_blocks, 0)
+
+        logger.info(
+            "Memory profiling results: total_gpu_memory=%.2fGiB"
+            " initial_memory_usage=%.2fGiB peak_torch_memory=%.2fGiB"
+            " memory_usage_post_profile=%.2fGib"
+            " non_torch_memory=%.2fGiB kv_cache_size=%.2fGiB"
+            " gpu_memory_utilization=%.2f", total_gpu_memory / (1024**3),
+            (total_gpu_memory - free_memory_pre_profile) / (1024**3),
+            (peak_memory - non_torch_allocations) / (1024**3),
+            total_allocated_bytes / (1024**3),
+            non_torch_allocations / (1024**3),
+            available_kv_cache_memory / (1024**3),
+            self.cache_config.gpu_memory_utilization)
+
+        # Final cleanup
+        if self.model_runner.lora_manager:
+            self.model_runner.remove_all_loras()
+        gc.collect()
+
+        return num_gpu_blocks, num_cpu_blocks
+
+    def load_pickle_if_exists(self, filepath):
+        if os.path.isfile(filepath):
+            try:
+                with open(filepath, 'rb') as f:
+                    data = pickle.load(f)
+                return data
+            except (pickle.UnpicklingError, EOFError) as e:
+                print(f"Error loading pickle file: {e}")
+                return None
+        else:
+            print(f"File {filepath} does not exist")
+            return None
+
+    def save_dict_to_pickle(self, dictionary, filepath):
+        try:
+            with open(filepath, 'wb') as f:  # 'wb' for write binary
+                pickle.dump(dictionary, f)
+            print(f"Dictionary successfully saved to {filepath}")
+        except Exception as e:
+            print(f"Error saving dictionary: {e}")
+
+    @torch.inference_mode()
+    def profile_exec_time(self) -> Dict[int, float]:
+        model_name = self.model_config.hf_config.name_or_path
+        model_name = model_name.replace("/", "_")
+        times_map = self.load_pickle_if_exists(
+            f"{model_name}_profile_data.pkl")
+
+        if times_map is None:
+            seq_lens = [1, 256, 512, 1024, 2048]
+            times_map = self.profile_cuda_graph(seq_lens)
+            self.save_dict_to_pickle(times_map,
+                                     f"{model_name}_profile_data.pkl")
+
+        return times_map
+
+    @torch.inference_mode()
+    def profile_cuda_graph(self, seq_lens):
+        times_map = {}
+        for seq_len in seq_lens:
+            print(f"=============Profiling seq_len: {seq_len}")
+            times_map[seq_len] = self.profile_seq_len_exec_time(seq_len)
+
+        # Profile the time other than cuda graph
+        seq_len = 1
+        repeat = 20  # Profile more time for stable result
+        all_batch_sizes = list(self.model_runner.graph_runners[0].keys())
+        times_map['overhead'] = {}
+        for batch_size in all_batch_sizes:
+            print(f"=============Profiling batch_size: {batch_size}")
+            start = time.perf_counter()
+            for _ in range(repeat):
+                self.execute_model(
+                    ExecuteModelRequest(seq_group_metadata_list=[
+                        SequenceGroupMetadata(
+                            request_id=f"{i}",
+                            is_prompt=False,
+                            seq_data={
+                                f"{i}":
+                                SequenceData.from_seqs(prompt_token_ids=[0] *
+                                                       seq_len,
+                                                       output_token_ids=[])
+                            },
+                            block_tables={f"{i}": [i]},
+                            sampling_params=SamplingParams(temperature=0.0))
+                        for i in range(batch_size)
+                    ],
+                                        finished_requests_ids=[],
+                                        num_steps=1))
+            end = time.perf_counter()
+            times_map['overhead'][batch_size] = (
+                end - start) / repeat - times_map[seq_len][batch_size]
+        return times_map
+
+    @torch.inference_mode()
+    def profile_seq_len_exec_time(self, seq_len) -> Dict[int, float]:
+        assert self.parallel_config.pipeline_parallel_size == 1
+        all_batch_sizes = list(self.model_runner.graph_runners[0].keys())
+        max_batch_size = max(all_batch_sizes)
+        input_ids = torch.zeros(max_batch_size,
+                                dtype=torch.long,
+                                device=self.device)
+        input_positions = torch.zeros(max_batch_size,
+                                      dtype=torch.long,
+                                      device=self.device)
+        slot_mapping = torch.zeros(max_batch_size,
+                                   dtype=torch.long,
+                                   device=self.device)
+        seq_lens_tensor = torch.ones(
+            max_batch_size, dtype=torch.long, device=self.device) * seq_len
+        block_tables = torch.zeros(
+            (max_batch_size, self.model_runner.get_max_block_per_batch()),
+            dtype=torch.long,
+            device=self.device)
+        fake_kv = torch.zeros(0)
+        times_map = {}
+        for batch_size in all_batch_sizes:
+            graph_runner = self.model_runner.graph_runners[0][batch_size]
+            attn_metadata = self.model_runner.\
+                attn_backend.make_metadata(
+                num_prefills=0,
+                num_prefill_tokens=0,
+                num_decode_tokens=batch_size,
+                slot_mapping=slot_mapping[:batch_size],
+                seq_lens=None,
+                seq_lens_tensor=seq_lens_tensor[:batch_size],
+                max_query_len=1,
+                max_decode_query_len=1,
+                max_prefill_seq_len=0,
+                max_decode_seq_len=self.model_runner.max_seq_len_to_capture,
+                query_start_loc=None,
+                seq_start_loc=None,
+                context_lens_tensor=None,
+                block_tables=block_tables[:batch_size],
+                use_cuda_graph=True,
+                multi_modal_placeholder_index_maps=None
+            )
+
+            # with set_forward_context(attn_metadata):
+            # warmup
+            graph_runner.forward(
+                input_ids=input_ids[:batch_size],
+                positions=input_positions[..., :batch_size],
+                kv_caches=fake_kv,
+                attn_metadata=attn_metadata,
+                intermediate_tensors=None)
+
+            torch.cuda.synchronize()
+            profile_start_time = time.perf_counter()
+            for _ in range(_NUM_PROFILE_ITERS):
+                # graph_runner._graph.replay()
+                graph_runner.forward(
+                    input_ids=input_ids[:batch_size],
+                    positions=input_positions[..., :batch_size],
+                    kv_caches=fake_kv,
+                    attn_metadata=attn_metadata,
+                    intermediate_tensors=None)
+            torch.cuda.synchronize()
+            profile_end_time = time.perf_counter()
+            profile_time = (profile_end_time -
+                            profile_start_time) / _NUM_PROFILE_ITERS
+            times_map[batch_size] = profile_time
+        return times_map
+
+    def _assert_memory_footprint_increased_during_profiling(self):
         # NOTE(woosuk): Here we assume that the other processes using the same
         # GPU did not change their memory usage during the profiling.
-        peak_memory = self.init_gpu_memory - free_gpu_memory
-        assert peak_memory > 0, (
+        free_gpu_memory, _ = torch.cuda.mem_get_info()
+        assert self.init_gpu_memory - free_gpu_memory > 0, (
             "Error in memory profiling. "
             f"Initial free memory {self.init_gpu_memory}, current free memory"
             f" {free_gpu_memory}. This happens when the GPU memory was "
             "not properly cleaned up before initializing the vLLM instance.")
-
-        cache_block_size = self.get_cache_block_size_bytes()
-        num_gpu_blocks = int(
-            (total_gpu_memory * self.cache_config.gpu_memory_utilization -
-             peak_memory) // cache_block_size)
-        num_cpu_blocks = int(self.cache_config.swap_space_bytes //
-                             cache_block_size)
-        num_gpu_blocks = max(num_gpu_blocks, 0)
-        num_cpu_blocks = max(num_cpu_blocks, 0)
-        if self.model_runner.lora_manager:
-            self.model_runner.remove_all_loras()
-        gc.collect()
-        torch.cuda.empty_cache()
-        return num_gpu_blocks, num_cpu_blocks
 
     def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:
@@ -256,6 +423,7 @@ class Worker(LocalOrDistributedWorkerBase):
         """
         raise_if_cache_size_invalid(num_gpu_blocks,
                                     self.cache_config.block_size,
+                                    self.cache_config.is_attention_free,
                                     self.model_config.max_model_len)
 
         self.cache_config.num_gpu_blocks = num_gpu_blocks
@@ -277,7 +445,7 @@ class Worker(LocalOrDistributedWorkerBase):
         ]
 
     def _warm_up_model(self) -> None:
-        if not self.model_config.enforce_eager:
+        if not self.model_runner.model_config.enforce_eager:
             self.model_runner.capture_model(self.gpu_cache)
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
@@ -453,26 +621,36 @@ def init_worker_distributed_environment(
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
     # Check if the GPU supports the dtype.
-    if torch_dtype == torch.bfloat16:
-        compute_capability = current_platform.get_device_capability()
-        if compute_capability[0] < 8:
+    if torch_dtype == torch.bfloat16:  # noqa: SIM102
+        if not current_platform.has_device_capability(80):
+            capability = current_platform.get_device_capability()
             gpu_name = current_platform.get_device_name()
+
+            if capability is None:
+                compute_str = "does not have a compute capability"
+            else:
+                version_str = capability.as_version_str()
+                compute_str = f"has compute capability {version_str}"
+
             raise ValueError(
                 "Bfloat16 is only supported on GPUs with compute capability "
-                f"of at least 8.0. Your {gpu_name} GPU has compute capability "
-                f"{compute_capability[0]}.{compute_capability[1]}. "
+                f"of at least 8.0. Your {gpu_name} GPU {compute_str}. "
                 "You can use float16 instead by explicitly setting the"
                 "`dtype` flag in CLI, for example: --dtype=half.")
 
 
-def raise_if_cache_size_invalid(num_gpu_blocks, block_size,
+def raise_if_cache_size_invalid(num_gpu_blocks, block_size, is_attention_free,
                                 max_model_len) -> None:
-    if num_gpu_blocks <= 0:
+    if is_attention_free and num_gpu_blocks != 0:
+        raise ValueError("No memory should be allocated for the cache blocks "
+                         f"for an attention-free model, but {num_gpu_blocks}"
+                         "blocks are allocated.")
+    if not is_attention_free and num_gpu_blocks <= 0:
         raise ValueError("No available memory for the cache blocks. "
                          "Try increasing `gpu_memory_utilization` when "
                          "initializing the engine.")
     max_seq_len = block_size * num_gpu_blocks
-    if max_model_len > max_seq_len:
+    if not is_attention_free and max_model_len > max_seq_len:
         raise ValueError(
             f"The model's max seq len ({max_model_len}) "
             "is larger than the maximum number of tokens that can be "

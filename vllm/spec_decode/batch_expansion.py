@@ -1,3 +1,4 @@
+import time
 from array import array
 from itertools import chain, count
 from typing import Iterator, List, Optional, Tuple
@@ -5,15 +6,14 @@ from typing import Iterator, List, Optional, Tuple
 import torch
 
 from vllm import SamplingParams
-from vllm.sequence import (VLLM_TOKEN_ID_ARRAY_TYPE, ExecuteModelRequest,
-                           SamplerOutput, SequenceData, SequenceGroupMetadata,
-                           get_all_seq_ids)
+from vllm.sequence import SamplerOutput
+from vllm.sequence import (VLLM_INVALID_TOKEN_ID, VLLM_TOKEN_ID_ARRAY_TYPE,
+                           ExecuteModelRequest, SequenceData,
+                           SequenceGroupMetadata, get_all_seq_ids)
 from vllm.spec_decode.interfaces import (SpeculativeProposals,
                                          SpeculativeScorer, SpeculativeScores)
-from vllm.spec_decode.util import (nvtx_range, sampler_output_to_torch,
-                                   split_batch_by_proposal_len)
-from vllm.worker.worker_base import WorkerBase
-
+from vllm.spec_decode.util import nvtx_range, split_batch_by_proposal_len
+from vllm.spec_decode.profile import SpecProfiler
 SeqId = int
 TargetSeqId = int
 TokenId = int
@@ -35,12 +35,6 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
     It only supports scoring the top1 proposal tokens of the proposer, instead
     of topk/tree.
     """
-
-    def __init__(self, scorer_worker: WorkerBase, device: str,
-                 vocab_size: int):
-        self._scorer_worker = scorer_worker
-        self._device = device
-        self._vocab_size = vocab_size
 
     @nvtx_range("BatchExpansionTop1Scorer.score_proposals")
     def score_proposals(
@@ -69,18 +63,22 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
         proposal_lens_list = proposals.proposal_lens.tolist()
         proposal_token_ids_list = proposals.proposal_token_ids.tolist()
 
-        # Filter the list to ignore -1 proposals.
+        if self._scorer_worker.speculative_config.rsd:
+            for i in range(len(proposal_lens_list)):
+                proposal_token_ids_list[i] = proposal_token_ids_list[i][:proposal_lens_list[i]]
+
+        # Filter the list to ignore invalid proposals.
         proposal_token_ids_list_without_skips = [
             proposals for proposals in proposal_token_ids_list
-            if -1 not in proposals
+            if VLLM_INVALID_TOKEN_ID not in proposals
         ]
 
         (spec_indices, non_spec_indices, target_seq_group_metadata_list,
          num_scoring_tokens) = self._expand_batch(
-             seq_group_metadata_list=execute_model_req.seq_group_metadata_list,
-             proposal_token_ids_list=proposal_token_ids_list_without_skips,
-             proposal_lens_list=proposal_lens_list,
-         )
+            seq_group_metadata_list=execute_model_req.seq_group_metadata_list,
+            proposal_token_ids_list=proposal_token_ids_list_without_skips,
+            proposal_lens_list=proposal_lens_list,
+        )
 
         target_sampler_output = self._scorer_worker.execute_model(
             execute_model_req=execute_model_req.clone(
@@ -88,17 +86,65 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
         assert len(target_sampler_output) == 1, "expected single-step output"
         target_sampler_output = target_sampler_output[0]
 
-        (all_tokens, all_probs, spec_logprobs,
-         all_hidden_states) = self._contract_batch(
-             contracted_bs=len(execute_model_req.seq_group_metadata_list),
-             target_sampler_output=target_sampler_output,
-             proposals=proposals,
-             num_scoring_tokens=num_scoring_tokens,
-             non_spec_indices=non_spec_indices,
-             spec_indices=spec_indices,
-             k=execute_model_req.num_lookahead_slots,
-         )
+        # AdaSpec: eliminate redundant draft tokens before scoring
+        if self._scorer_worker.speculative_config.rsd:
+            start_ts = time.perf_counter()
+            proposal_len = len(proposals.proposal_token_ids[0])
+            num_scoring_tokens = len(spec_indices) * (proposal_len + 1)
 
+            for idx, spec_indice in enumerate(spec_indices):
+                spec_len = proposal_lens_list[spec_indice]
+                if spec_len < proposal_len:
+                    padding_token_ids = torch.full((proposal_len - spec_len, 1), fill_value=-1 , dtype=torch.int64,
+                                                      device=target_sampler_output.sampled_token_ids.device)
+                    padding_token_probs = torch.zeros((proposal_len - spec_len, self._vocab_size),
+                                                  dtype=torch.float32, device=padding_token_ids.device)
+
+                    padding_logprobs = torch.full((proposal_len - spec_len, self._vocab_size), -float("inf"),
+                                                  dtype=torch.float32, device=proposals.proposal_probs.device)
+                    target_sampler_output.sampled_token_ids = torch.cat(
+                        (
+                            target_sampler_output.sampled_token_ids[:idx * (proposal_len + 1) + spec_len + 1],
+                            padding_token_ids,
+                            target_sampler_output.sampled_token_ids[idx * (proposal_len + 1) + spec_len + 1:],
+                        ), dim=0
+                    )
+                    target_sampler_output.sampled_token_probs = torch.cat(
+                        (
+                            target_sampler_output.sampled_token_probs[:idx * (proposal_len + 1) + spec_len + 1],
+                            padding_token_probs,
+                            target_sampler_output.sampled_token_probs[idx * (proposal_len + 1) + spec_len + 1:],
+                        ), dim=0
+                    )
+
+                    target_sampler_output.logprobs = torch.cat(
+                        (
+                            target_sampler_output.logprobs[:idx * (proposal_len + 1) + spec_len + 1],
+                            padding_logprobs,
+                            target_sampler_output.logprobs[idx * (proposal_len + 1) + spec_len + 1 :],
+                        ), dim=0
+                    )
+            end_ts = time.perf_counter()
+            SpecProfiler.rsd_overhead[-1] += (end_ts - start_ts)
+
+        if not non_spec_indices:
+            # All sequence groups in batch have spec decoding enabled
+            contracted = self._contract_batch_all_spec(
+                target_sampler_output=target_sampler_output,
+                proposals=proposals,
+            )
+        else:
+            # Batch has a mix of spec decode enabled and disabled seq groups
+            contracted = self._contract_batch(
+                contracted_bs=len(execute_model_req.seq_group_metadata_list),
+                target_sampler_output=target_sampler_output,
+                proposals=proposals,
+                num_scoring_tokens=num_scoring_tokens,
+                non_spec_indices=non_spec_indices,
+                spec_indices=spec_indices,
+            )
+
+        all_tokens, all_probs, spec_logprobs, all_hidden_states = contracted
         return SpeculativeScores(
             probs=all_probs,
             token_ids=all_tokens,
@@ -121,14 +167,9 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
         # proposal len. This adds some complexity (splitting the batch into spec
         # and non spec sequences) and should be removed in the future. It can be
         # done by supporting per-sequence proposal lens.
-        spec_seqs, spec_indices = split_batch_by_proposal_len(
-            seq_group_metadata_list,
-            proposal_lens_list,
-            select_proposal_len_zero=False)
-        non_spec_seqs, non_spec_indices = split_batch_by_proposal_len(
-            seq_group_metadata_list,
-            proposal_lens_list,
-            select_proposal_len_zero=True)
+        (spec_seqs, spec_indices), (non_spec_seqs, non_spec_indices) = \
+            split_batch_by_proposal_len(
+                seq_group_metadata_list, proposal_lens_list)
 
         target_seq_group_metadata_list = self._create_scoring_model_input(
             seq_group_metadata_list=spec_seqs,
@@ -137,6 +178,7 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
             # full seq_group_metadata_list, instead of only spec_seqs.
             target_seq_ids_iter=self._create_target_seq_id_iterator(
                 seq_ids=get_all_seq_ids(seq_group_metadata_list)),
+            spec_indices=spec_indices,
         )
 
         num_scoring_tokens = len(target_seq_group_metadata_list)
@@ -146,9 +188,13 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
                 num_scoring_tokens)
 
     def _contract_batch(
-        self, contracted_bs: int, target_sampler_output: SamplerOutput,
-        proposals: SpeculativeProposals, num_scoring_tokens: int,
-        non_spec_indices: List[int], spec_indices: List[int], k: int
+            self,
+            contracted_bs: int,
+            target_sampler_output: SamplerOutput,
+            proposals: SpeculativeProposals,
+            num_scoring_tokens: int,
+            non_spec_indices: List[int],
+            spec_indices: List[int],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                Optional[torch.Tensor]]:
         """Contract the expanded batch back into its original size.
@@ -162,7 +208,7 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
          non_spec_target_token_ids, non_spec_target_probs,
          non_spec_target_logprobs,
          non_spec_target_hidden_states) = self._split_scoring_output(
-             target_sampler_output, num_scoring_tokens)
+            target_sampler_output, num_scoring_tokens)
 
         # Map distinct sequences used to score each token
         # of shape [batch_size * k + 1] back to [batch_size, k + 1].
@@ -171,7 +217,7 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
         # The number of tokens in the expanded batch used for speculation is
         # equal to the total expanded batch size minus the number of samples for
         # non-speculative sequences.
-        non_spec_expanded_bs, _ = non_spec_target_token_ids.shape
+        non_spec_expanded_bs = len(non_spec_target_token_ids)
         spec_expanded_bs = expanded_batch_size - non_spec_expanded_bs
 
         target_token_ids = target_token_ids.reshape(spec_expanded_bs, k + 1)
@@ -181,7 +227,7 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
 
         if target_hidden_states is not None:
             target_hidden_states = target_hidden_states.reshape(
-                spec_expanded_bs, k + 1, target_hidden_states.shape[-1])
+                *target_token_ids.shape, target_hidden_states.shape[-1])
 
         all_tokens = target_token_ids.new_full(size=(contracted_bs, k + 1),
                                                fill_value=-1)
@@ -196,29 +242,64 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
             all_hidden_states = None
 
         if non_spec_indices:
-            all_tokens[non_spec_indices, :1] = non_spec_target_token_ids
-            all_probs[non_spec_indices, :1, :] = non_spec_target_probs
-            all_logprobs[non_spec_indices, :1, :] = non_spec_target_logprobs
-
+            all_tokens[non_spec_indices, :1] = \
+                non_spec_target_token_ids.unsqueeze(1)
+            all_probs[non_spec_indices, :1, :] = \
+                non_spec_target_probs.unsqueeze(1)
+            all_logprobs[non_spec_indices, :1, :] = \
+                non_spec_target_logprobs.unsqueeze(1)
             if all_hidden_states is not None:
-                all_hidden_states[
-                    non_spec_indices, :1, :] = non_spec_target_hidden_states
+                assert non_spec_target_hidden_states is not None
+                all_hidden_states[non_spec_indices, :1, :] = \
+                    non_spec_target_hidden_states.unsqueeze(1)
 
         if spec_indices:
             all_tokens[spec_indices] = target_token_ids
             all_probs[spec_indices] = target_probs
             all_logprobs[spec_indices] = target_logprobs
-
             if all_hidden_states is not None:
                 all_hidden_states[spec_indices] = target_hidden_states
 
         return all_tokens, all_probs, all_logprobs, all_hidden_states
+
+    def _contract_batch_all_spec(
+        self,
+        target_sampler_output: SamplerOutput,
+        proposals: SpeculativeProposals,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+               Optional[torch.Tensor]]:
+        """Contract the expanded batch back into its original size.
+        This maps the scores of speculative tokens back to their original
+        sequences.
+
+        It assumes all sequences in the batch were previously expanded.
+        """
+
+        # Map distinct sequences used to score each token
+        # of shape [batch_size * k + 1] back to [batch_size, k + 1].
+        contracted_bs, k = proposals.proposal_token_ids.shape
+
+        # Reshape tensors to original batch size
+        target_token_ids = target_sampler_output.sampled_token_ids.reshape(
+            contracted_bs, k + 1)
+        target_probs = target_sampler_output.sampled_token_probs.reshape(
+            *target_token_ids.shape, self._vocab_size)
+        target_logprobs = target_sampler_output.logprobs.reshape(
+            target_probs.shape)
+        target_hidden_states = target_sampler_output.hidden_states
+        if target_hidden_states is not None:
+            target_hidden_states = target_hidden_states.reshape(
+                *target_token_ids.shape, target_hidden_states.shape[-1])
+
+        return (target_token_ids, target_probs, target_logprobs,
+                target_hidden_states)
 
     def _create_scoring_model_input(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
         proposal_token_ids: List[List[TokenId]],  # shape: [batch_size, k]
         target_seq_ids_iter: Iterator[TargetSeqId],
+        spec_indices: List[int],
     ) -> List[SequenceGroupMetadata]:
         """Given the original input sequences and proposed tokens from the draft
         model, create a list of target sequences that can be used for scoring.
@@ -236,7 +317,7 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
                 self._create_target_seq_group_metadata(
                     seq_group_metadata,
                     proposal_token_ids,
-                    i,
+                    spec_indices[i],
                     target_seq_ids_iter,
                 ) for i, seq_group_metadata in enumerate(
                     seq_group_metadata_list)))
@@ -345,8 +426,9 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
             token_chunk_size=1,
         )
 
+    @staticmethod
     def _split_scoring_output(
-        self, sampler_output: SamplerOutput, num_scoring_tokens: int
+        sampler_output: SamplerOutput, num_scoring_tokens: int
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                Optional[torch.Tensor], torch.Tensor, torch.Tensor,
                torch.Tensor, Optional[torch.Tensor]]:
@@ -361,10 +443,9 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
         #
         # First samples are from speculative scoring, latter samples are non-
         # speculative samples.
-        split_sizes = [
-            num_scoring_tokens,
-            sampler_output.sampled_token_ids.numel() - num_scoring_tokens
-        ]
+        split_sizes = (num_scoring_tokens,
+                       sampler_output.sampled_token_ids.numel() -
+                       num_scoring_tokens)
         (spec_probs, non_spec_probs
          ) = sampler_output.sampled_token_probs.split(split_sizes)
         (spec_sampled_tokens, non_spec_sampled_tokens
@@ -382,32 +463,13 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
         else:
             spec_hidden_states, non_spec_hidden_states = None, None
 
-        # Convert scores to tensors.
-        sampler_output.sampled_token_probs = spec_probs
-        sampler_output.sampled_token_ids = spec_sampled_tokens
-        sampler_output.logprobs = spec_logprobs
-        sampler_output.hidden_states = spec_hidden_states
-        (target_token_ids, target_probs, target_logprobs,
-         target_hidden_states) = sampler_output_to_torch([sampler_output],
-                                                         True)
+        return (spec_sampled_tokens, spec_probs, spec_logprobs,
+                spec_hidden_states, non_spec_sampled_tokens, non_spec_probs,
+                non_spec_logprobs, non_spec_hidden_states)
 
-        # Convert non-speculative output tokens to tensors.
-        sampler_output.sampled_token_probs = non_spec_probs
-        sampler_output.sampled_token_ids = non_spec_sampled_tokens
-        sampler_output.logprobs = non_spec_logprobs
-        sampler_output.hidden_states = non_spec_hidden_states
-        (non_spec_target_token_ids, non_spec_target_probs,
-         non_spec_target_logprobs,
-         non_spec_target_hidden_states) = sampler_output_to_torch(
-             [sampler_output], True)
-
-        return (target_token_ids, target_probs, target_logprobs,
-                target_hidden_states, non_spec_target_token_ids,
-                non_spec_target_probs, non_spec_target_logprobs,
-                non_spec_target_hidden_states)
-
+    @staticmethod
     def _create_target_seq_id_iterator(
-            self, seq_ids: List[SeqId]) -> Iterator[TargetSeqId]:
+            seq_ids: List[SeqId]) -> Iterator[TargetSeqId]:
         """Create an iterator for creating target sequence ids.
         Target sequence ids are distinct from sequence ids because we create a
         distinct target sequence id for each proposal token to be scored.
@@ -417,8 +479,8 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
         """
         return count(start=max(seq_ids) + 1)
 
+    @staticmethod
     def _get_token_ids_to_score(
-        self,
         full_spec_token_ids: List[TokenId]  # shape: [k]
     ) -> List[List[TokenId]]:
         """Given an int tensor of proposal token ids, return a list of
@@ -439,8 +501,6 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
         empty_token_ids: List[TokenId] = []
 
         token_ids_to_score = [empty_token_ids]
-        token_ids_to_score.extend([
-            full_spec_token_ids[:i + 1]
-            for i in range(len(full_spec_token_ids))
-        ])
+        token_ids_to_score.extend(full_spec_token_ids[:i + 1]
+                                  for i in range(len(full_spec_token_ids)))
         return token_ids_to_score
